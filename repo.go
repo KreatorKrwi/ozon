@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -209,21 +210,10 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 	defer tx.Rollback()
 
 	_, err = tx.ExecContext(ctx, `
-			INSERT INTO orders (
-				order_uid, track_number, entry, locale, internal_signature,
-				customer_id, delivery_service, shardkey, sm_id, date_created, oof_shard
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-			ON CONFLICT (order_uid) DO UPDATE SET
-				track_number = EXCLUDED.track_number,
-				entry = EXCLUDED.entry,
-				locale = EXCLUDED.locale,
-				internal_signature = EXCLUDED.internal_signature,
-				customer_id = EXCLUDED.customer_id,
-				delivery_service = EXCLUDED.delivery_service,
-				shardkey = EXCLUDED.shardkey,
-				sm_id = EXCLUDED.sm_id,
-				date_created = EXCLUDED.date_created,
-				oof_shard = EXCLUDED.oof_shard`,
+        INSERT INTO orders (
+            order_uid, track_number, entry, locale, internal_signature,
+            customer_id, delivery_service, shardkey, sm_id, date_created, oof_shard
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		order.OrderUID,
 		order.TrackNumber,
 		order.Entry,
@@ -235,8 +225,12 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 		order.SmID,
 		order.DateCreated,
 		order.OofShard)
+
 	if err != nil {
-		return fmt.Errorf("вставка заказа: %w", err)
+		if !isDuplicateKeyError(err) {
+			return fmt.Errorf("вставка заказа: %w", err)
+		}
+		log.Printf("Заказ %s уже существует, пропускаем вставку", order.OrderUID)
 	}
 
 	if order.Delivery != nil {
@@ -335,4 +329,11 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 	}
 
 	return nil
+}
+
+func isDuplicateKeyError(err error) bool {
+	if pqErr, ok := err.(*pq.Error); ok {
+		return pqErr.Code == "23505"
+	}
+	return false
 }
