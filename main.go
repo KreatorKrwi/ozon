@@ -99,9 +99,10 @@ func main() {
 					reader.CommitMessages(context.Background(), msg) //почему вообще в сервис из другого сервиса должны приходить плохие данные? Пусть там и проверяют заранее
 					log.Println("Ошибка парсинга из кафки")
 				}
-				bdCtx0, cancel := context.WithTimeout(context.Background(), 2000*time.Millisecond)
-				defer cancel()
-				_ = repository.Insert(bdCtx0, &order)
+				err = repository.Insert(context.Background(), &order)
+				if err != nil {
+					log.Println("Ошибка вставки")
+				}
 				reader.CommitMessages(context.Background(), msg)
 			}
 		}()
