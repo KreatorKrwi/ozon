@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -96,9 +97,12 @@ func (r *Repo) GetCache(n int) []error {
 		SELECT order_uid FROM orders 
 		ORDER BY to_timestamp(date_created, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') DESC 
 		LIMIT $1`, n); err != nil {
+
+		if errors.Is(err, context.DeadlineExceeded) {
+			return []error{fmt.Errorf("db query timeout: %w", err)}
+		}
 		return []error{fmt.Errorf("failed to get orders: %w", err)}
 	}
-
 	var (
 		wg        sync.WaitGroup
 		semaphore = make(chan struct{}, 20)
@@ -106,11 +110,6 @@ func (r *Repo) GetCache(n int) []error {
 	)
 
 	for _, uid := range orderUIDs {
-		if ctx.Err() != nil {
-			errChan <- ctx.Err()
-			break
-		}
-
 		wg.Add(1)
 		go func(uid string) {
 			defer wg.Done()
