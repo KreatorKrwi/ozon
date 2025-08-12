@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log"
 	"net/http"
@@ -31,8 +32,6 @@ func runConsumer(consumer *kafka.Reader, msgChan chan<- kafka.Message) {
 		msgChan <- msg
 	}
 }
-
-//по хорошему, надо было бы создать таблицу товаров и использовать другую смежную таблицу для вставки в orders. Но так как ТЗ размытое, то вот так
 
 func main() {
 
@@ -75,10 +74,11 @@ func main() {
 
 	//подключаем кафку
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:     []string{"kafka:9092"},
-		Topic:       "orders",
-		GroupID:     "orderss",
-		StartOffset: kafka.FirstOffset,
+		Brokers:        []string{"kafka:9092"},
+		Topic:          "orders",
+		GroupID:        "orders-group",
+		GroupBalancers: []kafka.GroupBalancer{kafka.RoundRobinGroupBalancer{}},
+		StartOffset:    kafka.FirstOffset,
 	})
 
 	if err != nil {
@@ -99,7 +99,7 @@ func main() {
 					reader.CommitMessages(context.Background(), msg) //почему вообще в сервис из другого сервиса должны приходить плохие данные? Пусть там и проверяют заранее
 					log.Println("Ошибка парсинга из кафки")
 				}
-				err = repository.Insert(context.Background(), &order)
+				err = repository.Insert(context.Background(), &order) //ретраев не будет, тогда и dlq придется делать, я устал
 				if err != nil {
 					log.Println("Ошибка вставки")
 				}
@@ -134,17 +134,19 @@ func main() {
 			}
 		} else {
 
-			data, err := repository.Get(ctx.Request.Context(), orderID)
+			data, err := repository.Get(context.Background(), orderID)
 			if err != nil {
-				if err == sql.ErrNoRows {
+				if errors.Is(err, sql.ErrNoRows) {
 					ctx.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
 				} else {
 					ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 				}
 				return
 			}
+			redisCtx1, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			defer cancel()
 			if jsonData, err := json.Marshal(data); err == nil {
-				rediska.Set(redisCtx, orderID, jsonData, time.Hour)
+				rediska.Set(redisCtx1, orderID, jsonData, time.Hour)
 			}
 
 			ctx.JSON(http.StatusOK, data)

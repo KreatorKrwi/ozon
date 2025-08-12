@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -202,18 +201,21 @@ func (r *Repo) Get(ctx context.Context, orderUID string) (*Order, error) {
 	return order, nil
 }
 
+// Я истолковал так, что в каждом сообщении из другого сервиса обязательно присутсвует блок order, остально - опционально. Delivery и payment содержат только одну запись касательно одного заказа и при попытке вставки по тому же order_uid не дублируются, а обновляются. Для items это правило не работает по соображениям логики.
 func (r *Repo) Insert(ctx context.Context, order *Order) error {
+
+	var need bool = false
 	tx, err := r.db.Beginx()
 	if err != nil {
 		return fmt.Errorf("начало транзакции: %w", err)
 	}
 	defer tx.Rollback()
 
-	_, err = tx.ExecContext(ctx, `
+	res, err := tx.ExecContext(ctx, `
         INSERT INTO orders (
             order_uid, track_number, entry, locale, internal_signature,
             customer_id, delivery_service, shardkey, sm_id, date_created, oof_shard
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (order_uid) DO NOTHING`,
 		order.OrderUID,
 		order.TrackNumber,
 		order.Entry,
@@ -227,10 +229,17 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 		order.OofShard)
 
 	if err != nil {
-		if !isDuplicateKeyError(err) {
-			return fmt.Errorf("вставка заказа: %w", err)
-		}
-		log.Printf("Заказ %s уже существует, пропускаем вставку", order.OrderUID)
+		return fmt.Errorf("вставка заказа: %w", err)
+	}
+
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("проверка affected rows: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		log.Printf("Заказ %s уже существует, обновляем связанные данные", order.OrderUID)
+		need = true
 	}
 
 	if order.Delivery != nil {
@@ -316,7 +325,19 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 		return fmt.Errorf("коммит транзакции: %w", err)
 	}
 
-	jsonData, err := json.Marshal(order)
+	var corder Order
+	if need {
+		latestOrder, err := r.Get(context.Background(), order.OrderUID)
+		if err != nil {
+			log.Println("Не получилось достать свежие данные")
+			return nil
+		}
+		corder = *latestOrder
+	} else {
+		corder = *order
+	}
+
+	jsonData, err := json.Marshal(corder)
 	if err != nil {
 		return fmt.Errorf("ошибка сериализации: %w", err)
 	}
@@ -329,11 +350,4 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 	}
 
 	return nil
-}
-
-func isDuplicateKeyError(err error) bool {
-	if pqErr, ok := err.(*pq.Error); ok {
-		return pqErr.Code == "23505"
-	}
-	return false
 }
