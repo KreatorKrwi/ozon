@@ -2,112 +2,31 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"embed"
-	"encoding/json"
-	"errors"
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 	"time"
+	"wb-test/configs"
+	"wb-test/internal/cache"
+	"wb-test/internal/handlers"
+	"wb-test/internal/repository"
+	"wb-test/internal/service"
+	"wb-test/pkg/utils"
 
 	"github.com/gin-gonic/gin"
-	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
-	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
 )
 
 //go:embed frontend/*
 var frontendFS embed.FS
 
-func runConsumer(consumer *kafka.Reader, msgChan chan<- kafka.Message) {
-
-	for {
-		msg, err := consumer.FetchMessage(context.Background())
-		if err != nil {
-			log.Printf("Consumer error: %v", err)
-			continue
-		}
-		msgChan <- msg
-	}
-}
-
-func main() {
-
-	// пробрасываем конект к бд
-	cfg, err := Load()
-	if err != nil {
-		log.Fatal("Failed to load config:", err)
-	}
-	connSrt :=
-		"host=" + cfg.DB.Host +
-			" port=" + cfg.DB.Port +
-			" user=" + cfg.DB.User +
-			" password=" + cfg.DB.Password +
-			" dbname=" + cfg.DB.Name +
-			" sslmode=" + cfg.DB.SSLMode
-
-	db, err := sqlx.Connect("postgres", connSrt)
-	if err != nil {
-		log.Fatal("Failed to connect to DB:", err)
-	}
-	defer db.Close()
-
-	//выплевываем редис
-	rediska := redis.NewClient(&redis.Options{
-		Addr:     "redis:6379",
-		Password: "ozon_top",
-		DB:       0,
-	})
-
-	repository := NewRepo(db, rediska)
-
-	repository.CreateTablesIfNotExist()
-
-	go func() {
-		var ers []error = repository.GetCache(100)
-		for _, er := range ers {
-			log.Println(er)
-		}
-	}()
-
-	//подключаем кафку
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:        []string{"kafka:9092"},
-		Topic:          "orders",
-		GroupID:        "orders-group",
-		GroupBalancers: []kafka.GroupBalancer{kafka.RoundRobinGroupBalancer{}},
-		StartOffset:    kafka.FirstOffset,
-	})
-
-	if err != nil {
-		log.Fatal("Failed to create consumer:", err)
-	}
-	defer reader.Close()
-
-	mesChan := make(chan kafka.Message, 100)
-	go runConsumer(reader, mesChan)
-	defer close(mesChan)
-
-	for i := 0; i < 3; i++ {
-		go func() {
-			for msg := range mesChan {
-				var order Order
-				err = json.Unmarshal(msg.Value, &order)
-				if err != nil {
-					reader.CommitMessages(context.Background(), msg) //почему вообще в сервис из другого сервиса должны приходить плохие данные? Пусть там и проверяют заранее
-					log.Println("Ошибка парсинга из кафки")
-				}
-				err = repository.Insert(context.Background(), &order) //ретраев не будет, тогда и dlq придется делать, я устал
-				if err != nil {
-					log.Println("Ошибка вставки")
-				}
-				reader.CommitMessages(context.Background(), msg)
-			}
-		}()
-	}
-
+func setupRouter(handler *handlers.Handler, frontendFS embed.FS) *gin.Engine {
 	r := gin.Default()
 
 	frontendDir, _ := fs.Sub(frontendFS, "frontend")
@@ -118,40 +37,97 @@ func main() {
 		c.Data(http.StatusOK, "text/html", data)
 	})
 
-	r.GET("/order/:order_id", func(ctx *gin.Context) {
-		orderID := ctx.Param("order_id")
+	r.GET("/order/:order_id", handler.GetById)
 
-		redisCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-		defer cancel()
+	return r
+}
 
-		val, err := rediska.Get(redisCtx, orderID).Result()
-		if err == nil {
-			var cachedOrder Order
-			if err := json.Unmarshal([]byte(val), &cachedOrder); err == nil {
-				log.Println("Нашли в редисе")
-				ctx.JSON(http.StatusOK, cachedOrder)
-				return
-			}
-		} else {
+func main() {
 
-			data, err := repository.Get(context.Background(), orderID)
-			if err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					ctx.JSON(http.StatusNotFound, gin.H{"error": "Order not found"})
-				} else {
-					ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				}
-				return
-			}
-			redisCtx1, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-			defer cancel()
-			if jsonData, err := json.Marshal(data); err == nil {
-				rediska.Set(redisCtx1, orderID, jsonData, time.Hour)
-			}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
-			ctx.JSON(http.StatusOK, data)
+	//подгружаем конфиг
+	cfg, err := configs.Load()
+	if err != nil {
+		log.Fatal("Config load error")
+	}
+
+	//пробрасываем конект к бд
+	db, err := utils.Db_conn(cfg)
+	if err != nil {
+		log.Fatal("Database connection error")
+	}
+	defer db.Close()
+
+	//выплевываем редис
+	rediska := utils.Redis_conn()
+	if rediska == nil {
+		log.Fatal("Redis conn error")
+	}
+	defer rediska.Close()
+
+	//подключаем кафку
+	reader := utils.Kafka_consumer_conn()
+	if reader == nil {
+		log.Fatal("Kafka reader error")
+	}
+	defer reader.Close()
+
+	//инициализируем слои
+	repository := repository.NewRepo(db)
+	cache := cache.NewCache(rediska)
+	service := service.NewService(repository, cache)
+	handler := handlers.NewHandlers(service)
+
+	err = repository.CreateTablesIfNotExist()
+	if err != nil {
+		log.Fatal("Tables creation error")
+	}
+
+	//подгрузка в кэш
+	go func() {
+		var ers []error = service.GetInitCache(20)
+		for _, er := range ers {
+			log.Println(er)
 		}
-	})
+	}()
 
-	r.Run(":" + cfg.Server.Port)
+	//запуск консюмера + логики
+	mesChan := make(chan kafka.Message, 100)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go utils.RunConsumer(ctx, &wg, reader, mesChan)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go utils.Read_n_process(&wg, service, mesChan, reader)
+	}
+
+	//запуска сервера
+	server := &http.Server{
+		Addr:    ":" + cfg.Server.Port,
+		Handler: setupRouter(handler, frontendFS),
+	}
+
+	go func() {
+		log.Printf("Server starting on port %s", cfg.Server.Port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed: %v", err)
+		}
+	}()
+
+	//graceful shutdown
+	<-ctx.Done()
+	log.Println("Received shutdown signal")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+	}
+
+	wg.Wait()
+	log.Println("All goroutines finished")
 }

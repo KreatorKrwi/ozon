@@ -1,22 +1,20 @@
-package main
+package repository
 
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"log"
-	"sync"
-	"time"
+	"wb-test/internal/models"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/redis/go-redis/v9"
 )
 
 type Repo struct {
-	db    *sqlx.DB
-	redis *redis.Client
+	db *sqlx.DB
+}
+
+func NewRepo(db *sqlx.DB) *Repo {
+	return &Repo{db: db}
 }
 
 func (r *Repo) CreateTablesIfNotExist() error {
@@ -83,79 +81,20 @@ func (r *Repo) CreateTablesIfNotExist() error {
 	return nil
 }
 
-func NewRepo(db *sqlx.DB, redis *redis.Client) *Repo {
-	return &Repo{db: db, redis: redis}
-}
-
-func (r *Repo) GetCache(n int) []error {
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+func (r *Repo) GetIDS(ctx context.Context, n int) ([]string, error) {
 
 	var orderUIDs []string
 	if err := r.db.SelectContext(ctx, &orderUIDs, `
 		SELECT order_uid FROM orders 
 		ORDER BY to_timestamp(date_created, 'YYYY-MM-DD"T"HH24:MI:SS"Z"') DESC 
 		LIMIT $1`, n); err != nil {
-
-		if errors.Is(err, context.DeadlineExceeded) {
-			return []error{fmt.Errorf("db query timeout: %w", err)}
-		}
-		return []error{fmt.Errorf("failed to get orders: %w", err)}
+		return nil, err
 	}
-	var (
-		wg        sync.WaitGroup
-		semaphore = make(chan struct{}, 20)
-		errChan   = make(chan error, len(orderUIDs))
-	)
-
-	for _, uid := range orderUIDs {
-		wg.Add(1)
-		go func(uid string) {
-			defer wg.Done()
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			cacheCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			if err := r.cacheOrder(cacheCtx, uid); err != nil {
-				errChan <- fmt.Errorf("order %s: %w", uid, err)
-			}
-		}(uid)
-	}
-
-	go func() { wg.Wait(); close(errChan) }()
-
-	var errors []error
-	for err := range errChan {
-		errors = append(errors, err)
-	}
-
-	return errors
+	return orderUIDs, nil
 }
 
-func (r *Repo) cacheOrder(ctx context.Context, uid string) error {
-
-	order, err := r.Get(ctx, uid)
-	if err != nil {
-		return fmt.Errorf("get: %w", err)
-	}
-
-	jsonData, err := json.Marshal(order)
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
-
-	if err := r.redis.Set(ctx, uid, jsonData, 5*time.Minute).Err(); err != nil {
-		return fmt.Errorf("redis set: %w", err)
-	}
-
-	return nil
-}
-
-func (r *Repo) Get(ctx context.Context, orderUID string) (*Order, error) {
-	order := &Order{}
+func (r *Repo) Get(ctx context.Context, orderUID string) (*models.Order, error) {
+	order := &models.Order{}
 
 	err := r.db.GetContext(ctx, order, `
         SELECT * FROM orders WHERE order_uid = $1`, orderUID)
@@ -166,7 +105,7 @@ func (r *Repo) Get(ctx context.Context, orderUID string) (*Order, error) {
 		return nil, fmt.Errorf("order select: %w", err)
 	}
 
-	var delivery Delivery
+	var delivery models.Delivery
 	err = r.db.GetContext(ctx, &delivery, `
         SELECT name, phone, zip, city, address, region, email 
         FROM deliveries WHERE order_uid = $1`, orderUID)
@@ -176,7 +115,7 @@ func (r *Repo) Get(ctx context.Context, orderUID string) (*Order, error) {
 		return nil, fmt.Errorf("delivery select: %w", err)
 	}
 
-	var payment Payment
+	var payment models.Payment
 	err = r.db.GetContext(ctx, &payment, `
         SELECT transaction, currency, provider, amount, payment_dt,
                bank, delivery_cost, goods_total, custom_fee
@@ -187,7 +126,7 @@ func (r *Repo) Get(ctx context.Context, orderUID string) (*Order, error) {
 		return nil, fmt.Errorf("payment select: %w", err)
 	}
 
-	var items []Item
+	var items []models.Item
 	err = r.db.SelectContext(ctx, &items, `
         SELECT chrt_id, track_number, price, rid, name, sale,
                size, total_price, nm_id, brand, status
@@ -202,16 +141,15 @@ func (r *Repo) Get(ctx context.Context, orderUID string) (*Order, error) {
 }
 
 // Я истолковал так, что в каждом сообщении из другого сервиса обязательно присутсвует блок order, остально - опционально. Delivery и payment содержат только одну запись касательно одного заказа и при попытке вставки по тому же order_uid не дублируются, а обновляются. Для items это правило не работает по соображениям логики.
-func (r *Repo) Insert(ctx context.Context, order *Order) error {
+func (r *Repo) Insert(ctx context.Context, order *models.Order) error {
 
-	var need bool = false
 	tx, err := r.db.Beginx()
 	if err != nil {
 		return fmt.Errorf("начало транзакции: %w", err)
 	}
 	defer tx.Rollback()
 
-	res, err := tx.ExecContext(ctx, `
+	_, err = tx.ExecContext(ctx, `
         INSERT INTO orders (
             order_uid, track_number, entry, locale, internal_signature,
             customer_id, delivery_service, shardkey, sm_id, date_created, oof_shard
@@ -230,16 +168,6 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 
 	if err != nil {
 		return fmt.Errorf("вставка заказа: %w", err)
-	}
-
-	rowsAffected, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("проверка affected rows: %w", err)
-	}
-
-	if rowsAffected == 0 {
-		log.Printf("Заказ %s уже существует, обновляем связанные данные", order.OrderUID)
-		need = true
 	}
 
 	if order.Delivery != nil {
@@ -262,6 +190,7 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 			order.Delivery.Address,
 			order.Delivery.Region,
 			order.Delivery.Email)
+
 		if err != nil {
 			return fmt.Errorf("вставка доставки: %w", err)
 		}
@@ -292,6 +221,7 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 			order.Payment.DeliveryCost,
 			order.Payment.GoodsTotal,
 			order.Payment.CustomFee)
+
 		if err != nil {
 			return fmt.Errorf("вставка платежа: %w", err)
 		}
@@ -315,6 +245,7 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 				item.NmID,
 				item.Brand,
 				item.Status)
+
 			if err != nil {
 				return fmt.Errorf("вставка товара: %w", err)
 			}
@@ -323,30 +254,6 @@ func (r *Repo) Insert(ctx context.Context, order *Order) error {
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("коммит транзакции: %w", err)
-	}
-
-	var corder Order
-	if need {
-		latestOrder, err := r.Get(context.Background(), order.OrderUID)
-		if err != nil {
-			log.Println("Не получилось достать свежие данные")
-			return nil
-		}
-		corder = *latestOrder
-	} else {
-		corder = *order
-	}
-
-	jsonData, err := json.Marshal(corder)
-	if err != nil {
-		return fmt.Errorf("ошибка сериализации: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	if err := r.redis.Set(ctx, order.OrderUID, jsonData, 1*time.Hour).Err(); err != nil {
-		log.Printf("Ошибка Redis: %v", err)
 	}
 
 	return nil

@@ -2,14 +2,12 @@ module wb-test
 
 go 1.24.4
 
-require (
-	github.com/confluentinc/confluent-kafka-go/v2 v2.11.0
-	github.com/gin-gonic/gin v1.10.1
-)
+require github.com/gin-gonic/gin v1.10.1
 
 require (
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
+	github.com/google/go-cmp v0.6.0 // indirect
 	github.com/klauspost/compress v1.17.9 // indirect
 	github.com/pierrec/lz4/v4 v4.1.15 // indirect
 )
@@ -23,7 +21,7 @@ require (
 	github.com/gin-contrib/sse v0.1.0 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
-	github.com/go-playground/validator/v10 v10.20.0 // indirect
+	github.com/go-playground/validator/v10 v10.20.0
 	github.com/goccy/go-json v0.10.2 // indirect
 	github.com/jmoiron/sqlx v1.4.0
 	github.com/joho/godotenv v1.5.1
